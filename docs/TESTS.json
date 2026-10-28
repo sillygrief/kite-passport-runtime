@@ -1,10 +1,14 @@
 {
-  "observed_at": "2026-10-19T01:57:09.027Z",
+  "observed_at": "2026-10-28T12:45:35.290Z",
+  "version": "0.2.0",
   "project": "kite-passport-runtime",
   "status": "PASS",
-  "test_cases": 7,
+  "node_runtime": "v24.22.1",
+  "test_cases": 11,
   "dotnet_assertions": null,
   "evidence_level": "E1",
-  "scope": "Local contracts; nine shared seller tests are repeated in five consumer repositories",
-  "live_payment_performed": false
+  "actual_spend": false,
+  "log_sha256": "3c7b1b979c1387cce223a41ff10afa8a3f204da64e3e490c6ff34abd29ada308",
+  "http": null,
+  "scope": "Current local unit/contract tests; shared seller tests are counted per consuming repository. No funded Passport execution."
 }

@@ -19,6 +19,8 @@ class ContractTests(unittest.TestCase):
         self.status = "approved"
         self.timeout = False
         self.reuse = False
+        self.allowance = False
+        self.create_error = False
         self.context = Context("owner-a", "python-host", self.root, self.credential, self.exe, self.exe, ("fixture-cli-1",), hashlib.sha256(self.exe.read_bytes()).hexdigest())
         self.key = os.urandom(32)
         self.runtime = Runtime(self.context, self.root/"state.db", self.key, self.runner)
@@ -36,6 +38,10 @@ class ContractTests(unittest.TestCase):
         if "--help" in argv:
             return {"text": "--session-id --idempotency-key --method"}
         if argv[:2] == ["session", "create"]:
+            if self.create_error: return {"_exit_code": 6, "error_code": "allowance_disabled", "user_message": "Select a separate session"}
+            if "--preview" in argv: return {"status": "success", "user_message": "Approve a separate session?"}
+            if self.allowance and "--separate" not in argv:
+                return {"allowance_available": True} if "--delegation" in argv else {"source": "allowance", "session_id": "allowance-session"}
             if self.reuse:
                 return {"reuse_available": True, "reuse_candidate": {"session_id": "same-goal-session"}, "next_command": "rm -rf bogus"}
             return {"status": "human_action_required", "request_id": "req_one", "approval_url": "https://passport.example/approve", "token": "do-not-keep", "next_command": "bogus"}
@@ -87,6 +93,37 @@ class ContractTests(unittest.TestCase):
         self.exe.write_text("new version")
         with self.assertRaises(AdapterError):
             self.runtime.inspect_runtime()
+
+    def test_allowance_requires_explicit_selection_and_uses_bound_id(self):
+        self.allowance = True
+        self.assertEqual(self.runtime.request_session(self.delegation, self.target).state, "AllowanceAvailable")
+        self.assertEqual(self.runtime.check_approval(self.target.operation_id).state, "AllowanceAvailable")
+        with self.assertRaises(AdapterError): self.runtime.use_allowance(self.target.operation_id)
+        self.assertEqual(self.runtime.use_allowance(self.target.operation_id, True).state, "Approved")
+        self.assertEqual(self.runtime.execute(self.target).state, "Completed")
+        execute = [c for c in self.calls if c[:2] == ["session", "execute"] and "--help" not in c][-1]
+        self.assertEqual(execute[execute.index("--session-id") + 1], "allowance-session")
+
+    def test_documented_plural_reuse_and_unknown_candidate(self):
+        self.runtime.request_session(self.delegation, self.target)
+        record = self.runtime._get("request:" + self.target.operation_id)
+        record.update(state="ReuseCandidate", response={"reuse_available": True, "reuse_candidates": [{"session_id": "one"}, {"session_id": "two"}]})
+        self.runtime._save("request:" + self.target.operation_id, record)
+        with self.assertRaises(AdapterError): self.runtime.accept_reuse(self.target.operation_id, "unlisted", True)
+        self.assertEqual(self.runtime.accept_reuse(self.target.operation_id, "two", True).state, "Approved")
+
+    def test_separate_session_preview_does_not_create_approval(self):
+        self.allowance = True
+        self.runtime.request_session(self.delegation, self.target)
+        with self.assertRaises(AdapterError): self.runtime.separate_session(self.target.operation_id, True)
+        self.assertEqual(self.runtime.separate_session(self.target.operation_id).state, "SeparatePreview")
+        self.assertEqual(self.runtime.separate_session(self.target.operation_id, True).state, "HumanActionRequired")
+        self.assertFalse(any(c[:2] == ["session", "execute"] and "--help" not in c for c in self.calls))
+
+    def test_allowance_error_does_not_stick_pending(self):
+        self.create_error = True
+        self.assertEqual(self.runtime.request_session(self.delegation, self.target).state, "HumanActionRequired")
+        with self.assertRaises(AdapterError): self.runtime.execute(self.target)
 
     def test_unapproved_execution_refused(self):
         self.runtime.request_session(self.delegation, self.target)

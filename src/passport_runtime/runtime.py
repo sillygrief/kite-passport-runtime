@@ -115,7 +115,21 @@ class Runtime:
         self._guard()
         if not isinstance(query, str) or len(query) > 200:
             raise AdapterError("Invalid discovery query")
-        return Result("Completed", redact(self.runner(self.context.ksearch, ["service", "search", *(["--example", query] if example else [query])], 30)))
+        argv = ["service", "get", query, "--output", "json"] if example else ["service", "list", "--query", query, "--output", "json"]
+        response = self.runner(self.context.ksearch, argv, 30)
+        return Result("Blocked" if response.get("_exit_code", 0) else "Completed", redact(response))
+
+    @staticmethod
+    def _request_state(response):
+        if response.get("_exit_code", 0) or response.get("status") == "error":
+            return "HumanActionRequired" if response.get("error_code", "").startswith(("allowance_", "separate_session_")) else "Blocked"
+        if response.get("reuse_available"):
+            return "ReuseCandidate"
+        if response.get("allowance_available") or response.get("source") == "allowance":
+            return "AllowanceAvailable"
+        if response.get("source") == "separate" and response.get("session_id"):
+            return "ExistingSessionReview"
+        return "HumanActionRequired" if response.get("status") == "human_action_required" or response.get("reply_first") else "Pending" if response.get("request_id") else "Blocked"
 
     def request_session(self, delegation, target: TargetRequest):
         if self.inspect_runtime().state != "Ready":
@@ -124,9 +138,44 @@ class Runtime:
             raise AdapterError("Expected inner delegation")
         self._validate_target(target)
         response = self.runner(self.context.kpass, ["session", "create", "--delegation", json.dumps(delegation), "--output", "json"], 60)
-        state = "ReuseCandidate" if response.get("reuse_available") else "HumanActionRequired" if response.get("status") == "human_action_required" else "Pending"
+        state = self._request_state(response)
         # A session returned by create is not automatically treated as approved.
-        self._save("request:" + target.operation_id, {"binding": self.binding, "target": asdict(target), "response": redact(response), "state": state})
+        self._save("request:" + target.operation_id, {"binding": self.binding, "target": asdict(target), "delegation": delegation, "response": redact(response), "state": state})
+        return Result(state, redact(response))
+
+    def use_allowance(self, operation_id, confirmed_allowance=False):
+        """Bind an already approved account allowance; never fall back from a separate session."""
+        self._guard()
+        record = self._get("request:" + operation_id)
+        if not confirmed_allowance or not record or record["state"] != "AllowanceAvailable":
+            raise AdapterError("Explicit allowance selection required")
+        if self.inspect_runtime().state != "Ready":
+            raise AdapterError("CLI changed")
+        response = self.runner(self.context.kpass, ["session", "create", "--output", "json"], 60)
+        if (response.get("_exit_code", 0) or response.get("status") == "error"
+                or response.get("source") != "allowance" or not response.get("session_id")):
+            record.update(state="HumanActionRequired", response=redact(response))
+            self._save("request:" + operation_id, record)
+            return Result(record["state"], record["response"])
+        record.update(session_id=response["session_id"], funding_source="allowance", state="Approved", approval=redact(response))
+        self._save("request:" + operation_id, record)
+        return Result("Approved", redact(response))
+
+    def separate_session(self, operation_id, confirmed=False):
+        """Preview first. Only the caller's explicit confirmation can create a separate request."""
+        self._guard()
+        record = self._get("request:" + operation_id)
+        if not record or record["state"] in ("Approved", "Rejected", "Expired"):
+            raise AdapterError("Separate session is not available for this request")
+        if confirmed and record["state"] != "SeparatePreview":
+            raise AdapterError("Preview required before confirmation")
+        if self.inspect_runtime().state != "Ready":
+            raise AdapterError("CLI changed")
+        argv = ["session", "create", "--delegation", json.dumps(record["delegation"]), "--separate", *([] if confirmed else ["--preview"]), "--output", "json"]
+        response = self.runner(self.context.kpass, argv, 60)
+        state = self._request_state(response) if confirmed or response.get("_exit_code", 0) or response.get("status") == "error" else "SeparatePreview"
+        record.update(state=state, response=redact(response))
+        self._save("request:" + operation_id, record)
         return Result(state, redact(response))
 
     def check_approval(self, operation_id, wait=False):
@@ -153,12 +202,15 @@ class Runtime:
     def accept_reuse(self, operation_id, session_id, confirmed_same_goal=False):
         self._guard()
         record = self._get("request:" + operation_id)
-        candidate = (record or {}).get("response", {}).get("reuse_candidate", {})
-        if not confirmed_same_goal or candidate.get("session_id") != session_id:
+        response = (record or {}).get("response", {})
+        candidates = response.get("reuse_candidates") or [response.get("reuse_candidate", {})]
+        if record and record["state"] == "ExistingSessionReview":
+            candidates = [response]
+        if not confirmed_same_goal or not record or record["state"] not in ("ReuseCandidate", "ExistingSessionReview") or not any(c.get("session_id") == session_id for c in candidates):
             raise AdapterError("Reuse requires explicit same-goal review")
         # Only reconstruct known argv. Never execute next_command.
         response = self.runner(self.context.kpass, ["session", "use", "--session-id", session_id, "--output", "json"], 30)
-        if response.get("current_session_id") != session_id:
+        if response.get("_exit_code", 0) or response.get("current_session_id") != session_id:
             raise AdapterError("Reuse not confirmed")
         record.update(session_id=session_id, state="Approved")
         self._save("request:" + operation_id, record)

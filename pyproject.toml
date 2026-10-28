@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "kite-passport-runtime"
-version = "0.1.0"
+version = "0.2.0"
 description = "A bounded Python host adapter for the official kpass CLI"
 requires-python = ">=3.11"
 dependencies = ["cryptography>=44,<49"]
